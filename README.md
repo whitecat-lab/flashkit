@@ -51,7 +51,11 @@ This produces:
 
 ## Install The Privileged Helper
 
-Destructive device writes use a launchd-installed privileged helper instead of ad hoc AppleScript elevation.
+FlashKit prefers a launchd-installed privileged helper for smoother destructive writes, cleaner worker attribution, and better progress reporting.
+
+If the helper is missing or mismatched, FlashKit can still use the macOS administrator password prompt when a privileged write or capture needs elevation.
+
+For contributors and local testers, helper installation is recommended one-time setup when you want to exercise the helper-backed path explicitly or avoid repeated password prompts during destructive operations.
 
 Install it once:
 
@@ -64,6 +68,8 @@ Remove it:
 ```bash
 ./script/uninstall_privileged_helper.sh
 ```
+
+The install script builds the helper as your normal user first, then prompts for `sudo` only for the `/Library` install and `launchctl` bootstrap step.
 
 ## Bundled Helpers
 
