@@ -115,6 +115,19 @@ struct VerificationService {
         destinationDeviceNode: String,
         expectedBytes: Int64? = nil
     ) async throws {
+        do {
+            try compareStreams(
+                referenceURL: referenceURL,
+                destination: .device(destinationDeviceNode),
+                limit: expectedBytes ?? fileSize(of: referenceURL),
+                label: referenceURL.lastPathComponent
+            )
+            return
+        } catch VerificationServiceError.unreadable {
+            // Fall back to a privileged mirror for environments where the app
+            // does not own the device node.
+        }
+
         let destinationURL = try await stagedURL(for: .device(destinationDeviceNode), expectedBytes: expectedBytes ?? fileSize(of: referenceURL))
         defer { try? FileManager.default.removeItem(at: destinationURL) }
         try compareStreams(
@@ -375,7 +388,7 @@ struct VerificationService {
     }
 
     private func runPrivilegedDD(input: String, output: String, count: Int) async throws {
-        try await privileged.run(
+        _ = try await privileged.run(
             "/bin/dd",
             arguments: [
                 "if=\(input)",

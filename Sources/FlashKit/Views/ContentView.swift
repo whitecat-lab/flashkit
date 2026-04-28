@@ -85,6 +85,15 @@ struct ContentView: View {
             }
         }
         .background(background)
+        .overlay {
+            if model.isShowingWriteCompletion {
+                WriteCompletionOverlay {
+                    model.dismissWriteCompletion()
+                }
+                .transition(.scale(scale: 0.94).combined(with: .opacity))
+            }
+        }
+        .animation(.spring(response: 0.28, dampingFraction: 0.86), value: model.isShowingWriteCompletion)
         .confirmationDialog(
             "Erase \(model.selectedDisk?.displayName ?? "the selected disk")?",
             isPresented: $isWriteConfirmationPresented,
@@ -112,6 +121,12 @@ struct ContentView: View {
             Text("This will overwrite the selected USB disk with validation patterns for \(model.badBlockPassCount) pass(es).")
         }
         .alert("FlashKit", isPresented: $model.isShowingAlert) {
+            if let title = model.alertActionTitle,
+               let url = model.alertActionURL {
+                Button(title) {
+                    NSWorkspace.shared.open(url)
+                }
+            }
             Button("OK", role: .cancel) {}
         } message: {
             Text(model.alertMessage)
@@ -147,6 +162,11 @@ struct ContentView: View {
                 await model.handleDownloadLanguageChange()
             }
         }
+        .onChange(of: model.isShowingWriteCompletion) { _, isShowing in
+            if isShowing {
+                NSApp.requestUserAttention(.informationalRequest)
+            }
+        }
     }
 
     private var dragHandle: some View {
@@ -164,10 +184,26 @@ struct ContentView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text("FlashKit")
                 .font(.system(size: 24, weight: .bold, design: .rounded))
+
+            Text(appVersionLabel)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
         }
+    }
+
+    private var appVersionLabel: String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "dev"
+        guard let build = info["CFBundleVersion"] as? String,
+              !build.isEmpty
+        else {
+            return "v\(version)"
+        }
+        return "v\(version) (\(build))"
     }
 
     private var privilegedHelperPrompt: some View {
@@ -482,17 +518,30 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            Group {
-                if let progressFraction = model.progressFraction {
-                    ProgressView(value: progressFraction)
-                } else if isWriteStatusBusy {
-                    ProgressView()
-                } else {
-                    ProgressView(value: 0.0)
-                        .opacity(0.25)
-                }
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                WriteProgressIndicator(
+                    progressFraction: model.progressFraction,
+                    isBusy: isWriteStatusBusy,
+                    accessibilityValue: writeProgressAccessibilityValue
+                )
+
+                Text(writeProgressPercentText)
+                    .font(.body.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 48, alignment: .trailing)
+                    .contentTransition(.numericText())
+                    .accessibilityHidden(true)
             }
             .padding(.top, 4)
+
+            if let writeProgressDetailText {
+                Text(writeProgressDetailText)
+                    .font(.footnote.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .accessibilityLabel("Write progress details")
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 14)
@@ -582,6 +631,49 @@ struct ContentView: View {
             return nil
         }
         return message
+    }
+
+    private var writeProgressPercentText: String {
+        if let completedBytes = model.progressCompletedBytes,
+           let totalBytes = model.progressTotalBytes,
+           totalBytes > 0 {
+            return formattedPercent(Double(completedBytes) / Double(totalBytes))
+        }
+
+        if let progressFraction = model.progressFraction {
+            return formattedPercent(progressFraction)
+        }
+
+        return isWriteStatusBusy ? "…" : "0%"
+    }
+
+    private var writeProgressDetailText: String? {
+        guard let completedBytes = model.progressCompletedBytes,
+              let totalBytes = model.progressTotalBytes,
+              totalBytes > 0
+        else {
+            return nil
+        }
+
+        let completed = ByteCountFormatter.string(fromByteCount: completedBytes, countStyle: .file)
+        let total = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+        if let rate = model.progressRateBytesPerSecond, rate > 0 {
+            let rateText = ByteCountFormatter.string(fromByteCount: Int64(rate), countStyle: .file)
+            return "\(completed) of \(total) • \(rateText)/s"
+        }
+        return "\(completed) of \(total)"
+    }
+
+    private var writeProgressAccessibilityValue: String {
+        if let detail = writeProgressDetailText {
+            return "\(writeProgressPercentText), \(detail)"
+        }
+        return writeProgressPercentText
+    }
+
+    private func formattedPercent(_ value: Double) -> String {
+        let clamped = min(max(value, 0), 1)
+        return clamped.formatted(.percent.precision(.fractionLength(clamped < 0.1 && clamped > 0 ? 1 : 0)))
     }
 
     private var activityTechnicalDetails: [String] {

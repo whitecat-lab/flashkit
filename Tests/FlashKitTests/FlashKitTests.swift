@@ -274,6 +274,32 @@ struct FlashKitTests {
     }
 
     @Test
+    func commandLineRawWriterCopiesExpectedBytes() throws {
+        let sourceURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("img")
+        let destinationURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("img")
+        let payload = Data((0..<8192).map { UInt8($0 % 251) })
+        try payload.write(to: sourceURL)
+        FileManager.default.createFile(atPath: destinationURL.path(), contents: nil)
+        defer {
+            try? FileManager.default.removeItem(at: sourceURL)
+            try? FileManager.default.removeItem(at: destinationURL)
+        }
+
+        let bytesWritten = try FlashKitCommandLineTool.copyRawBytes(
+            sourcePath: sourceURL.path(),
+            destinationPath: destinationURL.path(),
+            expectedBytes: Int64(payload.count)
+        )
+
+        #expect(bytesWritten == Int64(payload.count))
+        #expect(try Data(contentsOf: destinationURL) == payload)
+    }
+
+    @Test
     func privilegedCommandServiceFallsBackToPasswordPromptPathForSubprocessesWhenHelperIsMissing() async throws {
         let fallback = RecordingPrivilegedClient()
         let service = PrivilegedCommandService(
@@ -325,6 +351,77 @@ struct FlashKitTests {
         #expect(recorded[0].sourceFilePath == sourceURL.path())
         #expect(recorded[0].destinationDeviceNode == "/dev/rdisk8")
         #expect(recorded[0].expectedBytes == 4096)
+    }
+
+    @Test
+    func privilegedCommandServiceFallsBackForRawWriteDevicePermissionDenials() async throws {
+        let sourceURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("iso")
+        try Data(repeating: 0xEF, count: 4096).write(to: sourceURL)
+        defer { try? FileManager.default.removeItem(at: sourceURL) }
+
+        let fallback = RecordingPrivilegedClient()
+        let service = PrivilegedCommandService(
+            helperClient: FailingPrivilegedClient(
+                error: .remoteFailure(
+                    "Unable to open /dev/rdisk4 for writing (raw device: Operation not permitted (errno 1))."
+                )
+            ),
+            fallbackClient: fallback
+        )
+
+        _ = try await service.writeRaw(
+            input: .file(sourceURL),
+            to: "/dev/rdisk4",
+            expectedBytes: 4096,
+            phase: "Restoring image",
+            message: "Writing the source image to the raw device.",
+            targetExpectation: nil
+        )
+
+        let recorded = await fallback.snapshotRawWriteRequests()
+
+        #expect(recorded.count == 1)
+        #expect(recorded[0].sourceFilePath == sourceURL.path())
+        #expect(recorded[0].destinationDeviceNode == "/dev/rdisk4")
+    }
+
+    @Test
+    func privilegedCommandServiceFallsBackForDDDevicePermissionDenials() async throws {
+        let sourceURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("iso")
+        try Data(repeating: 0xAC, count: 4096).write(to: sourceURL)
+        defer { try? FileManager.default.removeItem(at: sourceURL) }
+
+        let fallback = RecordingPrivilegedClient()
+        let service = PrivilegedCommandService(
+            helperClient: FailingPrivilegedClient(
+                error: .remoteFailure(
+                    """
+                    Forced unmount of all volumes on disk4 was successful
+                    dd: /dev/rdisk4: Operation not permitted
+                    """
+                )
+            ),
+            fallbackClient: fallback
+        )
+
+        _ = try await service.writeRaw(
+            input: .file(sourceURL),
+            to: "/dev/rdisk4",
+            expectedBytes: 4096,
+            phase: "Restoring image",
+            message: "Writing the source image to the raw device.",
+            targetExpectation: nil
+        )
+
+        let recorded = await fallback.snapshotRawWriteRequests()
+
+        #expect(recorded.count == 1)
+        #expect(recorded[0].sourceFilePath == sourceURL.path())
+        #expect(recorded[0].destinationDeviceNode == "/dev/rdisk4")
     }
 
     @Test
@@ -1167,6 +1264,29 @@ struct FlashKitTests {
 
         #expect(profile.format == .dd)
         #expect(profile.supportedMediaModes == [.directImage, .driveRestore])
+    }
+
+    @Test
+    func unmountableHybridFedoraISOFallsBackToDirectImageInspection() async throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let isoURL = directory.appendingPathComponent("Fedora-Workstation-Live-44-1.7.x86_64.iso")
+        try makeOpticalImageFixture(at: isoURL, hybridMBR: true)
+
+        let profile = try await ImageInspectionService(mounter: FailingDiskImageMounter())
+            .inspectImage(at: isoURL)
+
+        #expect(profile.format == .iso)
+        #expect(profile.supportedMediaModes == [.directImage])
+        #expect(profile.supportsLinuxBoot)
+        #expect(profile.linuxDistribution == .fedora)
+        #expect(profile.isoHybridStyle == .hybridMBR)
+        #expect(profile.classification?.imageKind == .hybridISO)
+        #expect(profile.classification?.recommendedWriteStrategy == .preserveHybridDirectWrite)
+        #expect(profile.notes.contains(where: { $0.contains("could not mount") }))
     }
 
     @Test
@@ -2586,5 +2706,13 @@ struct FlashKitTests {
         bytes[descriptorOffset + 6] = 0x01
 
         try bytes.write(to: url)
+    }
+
+    private struct FailingDiskImageMounter: DiskImageMounting {
+        func mountImage(at imageURL: URL) async throws -> MountedDiskImage {
+            throw DiskImageMounterError.mountPointUnavailable
+        }
+
+        func detach(_ mountedImage: MountedDiskImage) async throws {}
     }
 }

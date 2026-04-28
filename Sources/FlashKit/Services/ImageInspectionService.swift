@@ -1,8 +1,12 @@
 import Foundation
 
 struct ImageInspectionService {
-    private let mounter = DiskImageMounter()
+    private let mounter: any DiskImageMounting
     private let rawDiskImageService = RawDiskImageService()
+
+    init(mounter: any DiskImageMounting = DiskImageMounter()) {
+        self.mounter = mounter
+    }
 
     func inspectImage(at sourceURL: URL) async throws -> SourceImageProfile {
         let values = try sourceURL.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
@@ -156,7 +160,22 @@ struct ImageInspectionService {
         isoHybridStyle: ISOHybridStyle,
         probe: ImageBinaryProbe
     ) async throws -> SourceImageProfile {
-        let mounted = try await mounter.mountImage(at: sourceURL)
+        let mounted: MountedDiskImage
+        do {
+            mounted = try await mounter.mountImage(at: sourceURL)
+        } catch {
+            guard format == .iso || format == .udfISO else {
+                throw error
+            }
+
+            return inspectUnmountableOpticalImage(
+                sourceURL: sourceURL,
+                format: format,
+                size: size,
+                isoHybridStyle: isoHybridStyle,
+                probe: probe
+            )
+        }
 
         do {
             let profile = try inspectMountedRoot(
@@ -174,6 +193,64 @@ struct ImageInspectionService {
             try? await mounter.detach(mounted)
             throw error
         }
+    }
+
+    private func inspectUnmountableOpticalImage(
+        sourceURL: URL,
+        format: SourceImageFormat,
+        size: Int64,
+        isoHybridStyle: ISOHybridStyle,
+        probe: ImageBinaryProbe
+    ) -> SourceImageProfile {
+        let distribution = linuxDistributionFromFilename(sourceURL)
+        let supportsLinuxBoot = distribution != .none || isoHybridStyle.isHybrid
+        let hasBIOS = isoHybridStyle == .hybridMBR || isoHybridStyle == .hybridMBRAndGPT
+        let hasEFI = isoHybridStyle == .hybridGPT || isoHybridStyle == .hybridMBRAndGPT || isoHybridStyle.isHybrid
+        let classification = classify(
+            sourceURL: sourceURL,
+            probe: probe,
+            volumeName: nil,
+            bootArtifacts: [],
+            hasEFI: hasEFI,
+            hasBIOS: hasBIOS,
+            layoutHints: .empty
+        )
+        let detectedDistribution = supportsLinuxBoot && distribution == .none ? LinuxDistribution.generic : distribution
+        var notes = [
+            "macOS could not mount this ISO for file-level inspection, so FlashKit will use binary image signatures and direct-write planning."
+        ]
+        if supportsLinuxBoot {
+            let distro = detectedDistribution.displayName ?? "Linux"
+            notes.append("\(distro) boot media was inferred from image metadata.")
+        }
+        if let hybridLabel = isoHybridStyle.shortLabel {
+            notes.append("\(hybridLabel) detected.")
+        }
+
+        return SourceImageProfile(
+            sourceURL: sourceURL,
+            format: format,
+            size: size,
+            detectedVolumeName: nil,
+            hasEFI: hasEFI,
+            hasBIOS: hasBIOS,
+            oversizedPaths: [],
+            bootArtifactPaths: [],
+            supportedMediaModes: [.directImage],
+            notes: notes,
+            windows: nil,
+            supportsDOSBoot: false,
+            supportsLinuxBoot: supportsLinuxBoot,
+            supportsPersistence: false,
+            persistenceFlavor: .none,
+            secureBootValidationCandidate: hasEFI,
+            downloadFamily: nil,
+            isoHybridStyle: isoHybridStyle,
+            linuxDistribution: detectedDistribution,
+            linuxBootFixes: [],
+            applianceProfile: applianceProfile(from: classification),
+            classification: classification
+        )
     }
 
     private func inspectMountedRoot(
@@ -627,6 +704,27 @@ struct ImageInspectionService {
             || relativePath.hasPrefix("isolinux/")
             || relativePath.hasPrefix("syslinux/")
             || relativePath.hasPrefix("loader/entries/")
+    }
+
+    private func linuxDistributionFromFilename(_ sourceURL: URL) -> LinuxDistribution {
+        let filename = sourceURL.lastPathComponent.lowercased()
+        if filename.contains("fedora") {
+            return .fedora
+        }
+        if filename.contains("ubuntu") || filename.contains("pop-os") || filename.contains("linuxmint") {
+            return .ubuntu
+        }
+        if filename.contains("kali") {
+            return .kali
+        }
+        if filename.contains("debian") {
+            return .debian
+        }
+        if filename.contains("archlinux") || filename.contains("arch-") {
+            return .arch
+        }
+
+        return .none
     }
 
     private func directorySize(at root: URL) throws -> Int64 {

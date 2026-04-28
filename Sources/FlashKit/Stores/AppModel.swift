@@ -57,12 +57,18 @@ final class AppModel {
     var currentPhase = ""
     var currentMessage = "Pick a Windows ISO and a removable USB disk."
     var progressFraction: Double?
+    var progressCompletedBytes: Int64?
+    var progressTotalBytes: Int64?
+    var progressRateBytesPerSecond: Double?
     var logLines: [String] = []
     var privilegedHelperAvailability: PrivilegedHelperAvailability = .available
     var isInstallingPrivilegedHelper = false
 
     var alertMessage = ""
     var isShowingAlert = false
+    var alertActionTitle: String?
+    var alertActionURL: URL?
+    var isShowingWriteCompletion = false
 
     private enum OperationKind: String {
         case write
@@ -280,10 +286,7 @@ final class AppModel {
         currentPhase = "Image selected"
         currentMessage = url.lastPathComponent
         appendLog("Selected source image: \(url.path())")
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { await self.analyzeSelectedImage() }
-            group.addTask { await self.computeAutomaticHash() }
-        }
+        await analyzeSelectedImage()
     }
 
     func analyzeSelectedImage() async {
@@ -524,8 +527,14 @@ final class AppModel {
         currentPhase = "Starting write"
         currentMessage = "Preparing \(selectedDisk.deviceNode)."
         progressFraction = 0.0
+        progressCompletedBytes = nil
+        progressTotalBytes = nil
+        progressRateBytesPerSecond = nil
         isShowingAlert = false
         alertMessage = ""
+        alertActionTitle = nil
+        alertActionURL = nil
+        isShowingWriteCompletion = false
 
         defer { isWriting = false }
 
@@ -554,6 +563,7 @@ final class AppModel {
 
             appendLog("Write completed successfully.")
             await refreshDisks()
+            isShowingWriteCompletion = true
         } catch {
             if isCancellationLikeError(error) {
                 handleCancellation(of: .write)
@@ -562,6 +572,10 @@ final class AppModel {
                 presentError(error.localizedDescription)
             }
         }
+    }
+
+    func dismissWriteCompletion() {
+        isShowingWriteCompletion = false
     }
 
     func runBadBlockTest() async {
@@ -625,9 +639,14 @@ final class AppModel {
         currentPhase = "Capturing drive"
         currentMessage = "Preparing \(selectedDisk.displayName) for capture."
         progressFraction = 0.0
+        progressCompletedBytes = nil
+        progressTotalBytes = nil
+        progressRateBytesPerSecond = nil
         lastCaptureURL = nil
         isShowingAlert = false
         alertMessage = ""
+        alertActionTitle = nil
+        alertActionURL = nil
 
         defer { isCapturingDrive = false }
 
@@ -674,6 +693,9 @@ final class AppModel {
         currentPhase = update.phase
         currentMessage = update.message
         progressFraction = update.fractionCompleted
+        progressCompletedBytes = update.completedBytes
+        progressTotalBytes = update.totalBytes
+        progressRateBytesPerSecond = update.rateBytesPerSecond
         if update.shouldLogMessage {
             appendLog("\(update.phase): \(update.message)")
         }
@@ -721,17 +743,51 @@ final class AppModel {
     }
 
     private func presentError(_ message: String) {
+        let normalized = normalizedPrivacyDenialMessage(from: message) ?? message
         currentPhase = "Stopped"
-        currentMessage = message
-        alertMessage = message
+        currentMessage = normalized
+        alertMessage = normalized
+        if normalized.contains("Full Disk Access") {
+            alertActionTitle = "Open Full Disk Access"
+            alertActionURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+        } else {
+            alertActionTitle = nil
+            alertActionURL = nil
+        }
         isShowingAlert = true
-        appendLog("Error: \(message)")
+        appendLog("Error: \(normalized)")
+    }
+
+    private func normalizedPrivacyDenialMessage(from message: String) -> String? {
+        let lowercased = message.lowercased()
+        guard lowercased.contains("operation not permitted"),
+              lowercased.contains("/dev/rdisk")
+        else {
+            return nil
+        }
+
+        let device = rawDeviceNode(in: message) ?? "the selected raw USB device"
+        return """
+        macOS denied FlashKit raw access to \(device), even after administrator approval.
+
+        This is a Full Disk Access privacy block, not a mount/unmount failure. Add FlashKit to System Settings > Privacy & Security > Full Disk Access, relaunch FlashKit, then try the write again.
+        """
+    }
+
+    private func rawDeviceNode(in message: String) -> String? {
+        message.range(
+            of: #"/dev/rdisk[0-9]+[A-Za-z0-9]*"#,
+            options: .regularExpression
+        ).map { String(message[$0]) }
     }
 
     private func handleCancellation(of operationKind: OperationKind) {
         currentPhase = "Cancelled"
         currentMessage = operationKind.cancellationMessage
         progressFraction = nil
+        progressCompletedBytes = nil
+        progressTotalBytes = nil
+        progressRateBytesPerSecond = nil
         appendLog(operationKind.cancellationMessage)
     }
 

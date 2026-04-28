@@ -8,8 +8,10 @@ BUILD_BINARY_NAME="FlashKit"
 PRIVILEGED_HELPER_PRODUCT="FlashKitPrivilegedHelper"
 PRIVILEGED_HELPER_SERVICE="io.flashkit.FlashKit.PrivilegedHelper"
 MIN_SYSTEM_VERSION="15.0"
+APP_VERSION="0.2.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+APP_BUILD="$(date -u +%Y%m%d%H%M)"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
@@ -61,6 +63,10 @@ cat >"$INFO_PLIST" <<PLIST
   <string>$APP_NAME</string>
   <key>CFBundleIdentifier</key>
   <string>$BUNDLE_ID</string>
+  <key>CFBundleShortVersionString</key>
+  <string>$APP_VERSION</string>
+  <key>CFBundleVersion</key>
+  <string>$APP_BUILD</string>
 PLIST
 
 if [[ -f "$APP_ICON_FILE" ]]; then
@@ -77,8 +83,12 @@ cat >>"$INFO_PLIST" <<PLIST
   <string>APPL</string>
   <key>LSMinimumSystemVersion</key>
   <string>$MIN_SYSTEM_VERSION</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>FlashKit needs access to selected disk images in Downloads to create bootable USB media.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>FlashKit needs access to removable volumes so it can unmount and write selected USB drives.</string>
 </dict>
 </plist>
 PLIST
@@ -91,6 +101,10 @@ cat >"$APP_LAUNCHDAEMONS/$PRIVILEGED_HELPER_SERVICE.plist" <<PLIST
 <dict>
   <key>Label</key>
   <string>$PRIVILEGED_HELPER_SERVICE</string>
+  <key>AssociatedBundleIdentifiers</key>
+  <array>
+    <string>$BUNDLE_ID</string>
+  </array>
   <key>MachServices</key>
   <dict>
     <key>$PRIVILEGED_HELPER_SERVICE</key>
@@ -111,9 +125,17 @@ open_app() {
   /usr/bin/open -n "$APP_BUNDLE"
 }
 
+install_app() {
+  /usr/bin/ditto --rsrc --extattr "$APP_BUNDLE" "/Applications/$APP_NAME.app"
+}
+
 case "$MODE" in
   run)
     open_app
+    ;;
+  --install-app|install-app)
+    install_app
+    /usr/bin/open -n "/Applications/$APP_NAME.app"
     ;;
   --debug|debug)
     lldb -- "$APP_BINARY"
@@ -132,7 +154,7 @@ case "$MODE" in
     pgrep -x "$APP_NAME" >/dev/null
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2
+    echo "usage: $0 [run|--install-app|--debug|--logs|--telemetry|--verify]" >&2
     exit 2
     ;;
 esac

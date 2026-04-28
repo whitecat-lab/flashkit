@@ -5,6 +5,8 @@ import OSLog
 enum DriveImagingServiceError: LocalizedError {
     case missingHelper(HelperTool)
     case sourceImageTooLarge(sourceBytes: Int64, diskBytes: Int64)
+    case sourceStagingFailed(String)
+    case removableVolumePermissionDenied(String)
 
     var errorDescription: String? {
         switch self {
@@ -12,6 +14,10 @@ enum DriveImagingServiceError: LocalizedError {
             return "The helper \(tool.rawValue) is required for this drive imaging operation."
         case let .sourceImageTooLarge(sourceBytes, diskBytes):
             return "The prepared raw image is \(ByteCountFormatter.string(fromByteCount: sourceBytes, countStyle: .file)), which is larger than the selected USB drive (\(ByteCountFormatter.string(fromByteCount: diskBytes, countStyle: .file)))."
+        case let .sourceStagingFailed(message):
+            return message
+        case let .removableVolumePermissionDenied(message):
+            return message
         }
     }
 }
@@ -20,6 +26,7 @@ struct DriveImagingService {
     private let logger = Logger(subsystem: "FlashKit", category: "DriveImagingWrite")
     private let privileged = PrivilegedCommandService()
     private let runner = ProcessRunner()
+    private let diskService = DiskService()
     private let verificationService = VerificationService()
     private let rawDiskImageService = RawDiskImageService()
     private let rawDeviceWriter = RawDeviceWriterService()
@@ -41,6 +48,10 @@ struct DriveImagingService {
         let preferStreaming = executionMetadata?.decompressionStreamingActive ?? true
         let helperTargetExpectation = privilegedTargetExpectation(for: targetDisk, options: options)
         var runtimeExecutionMetadata = executionMetadata
+        var stagedSourceCleanup: (@Sendable () -> Void)?
+        defer {
+            stagedSourceCleanup?()
+        }
 
         if sourceProfile.format == .dd {
             let rawInput = try await rawDiskImageService.writeInput(
@@ -65,7 +76,8 @@ struct DriveImagingService {
                 details: BackendActivityLogFormatter.partitionWriteLines(for: plan, volumeLabel: "")
             )
         )
-        _ = try await privileged.run("/usr/sbin/diskutil", arguments: ["unmountDisk", "force", targetDisk.deviceNode])
+        try await requestRemovableVolumeAccessIfNeeded(targetDisk)
+        try await prepareTargetForRawWrite(targetDisk)
 
         switch sourceProfile.format {
         case .dd:
@@ -84,16 +96,14 @@ struct DriveImagingService {
                     range: BackendPhaseRange(start: 0.22, end: 0.90),
                     progress: progress
                 )
-                _ = try await rawDeviceWriter.write(
-                    input: verificationInput,
+                _ = try await writeRawInput(
+                    verificationInput,
                     to: rawDeviceNode,
                     expectedBytes: verificationInput.logicalSizeHint ?? sourceProfile.size,
                     targetExpectation: helperTargetExpectation,
                     phase: "Restoring image",
                     message: restoreMessage,
-                    eventHandler: { event in
-                        await restoreBridge.handleWorkerEvent(event)
-                    }
+                    restoreBridge: restoreBridge
                 )
                 if let telemetry = await restoreBridge.snapshotTelemetry() {
                     runtimeExecutionMetadata = runtimeExecutionMetadata?.applying(workerTelemetry: telemetry)
@@ -101,24 +111,28 @@ struct DriveImagingService {
             }
         case .iso, .udfISO, .dmg, .unknown:
             logger.info("phase=restoring image=\(sourceProfile.displayName, privacy: .public) target=\(targetDisk.deviceNode, privacy: .public) mode=direct")
+            await progress(.init(phase: "Staging source", message: "Preparing the source image for the raw-device writer.", fractionCompleted: 0.18))
+            let stagedSource = try await stageSourceForPrivilegedRead(sourceURL) { copied, total, message in
+                let fraction = 0.16 + (Double(copied) / Double(max(total, 1)) * 0.04)
+                await progress(.init(phase: "Staging source", message: message, fractionCompleted: fraction, completedBytes: copied, totalBytes: total))
+            }
+            stagedSourceCleanup = stagedSource.cleanup
             await progress(.init(phase: "Restoring image", message: "Writing the source image to the raw device.", fractionCompleted: 0.20))
-            let rawInput = RawWriteInput.file(sourceURL)
+            let rawInput = RawWriteInput.file(stagedSource.url)
             let restoreBridge = WorkerProgressBridge(
                 phase: "Restoring image",
                 baseMessage: "Writing the source image to the raw device.",
                 range: BackendPhaseRange(start: 0.20, end: 0.90),
                 progress: progress
             )
-            _ = try await rawDeviceWriter.write(
-                input: rawInput,
+            _ = try await writeRawInput(
+                rawInput,
                 to: rawDeviceNode,
                 expectedBytes: rawInput.logicalSizeHint ?? sourceProfile.size,
                 targetExpectation: helperTargetExpectation,
                 phase: "Restoring image",
                 message: "Writing the source image to the raw device.",
-                eventHandler: { event in
-                    await restoreBridge.handleWorkerEvent(event)
-                }
+                restoreBridge: restoreBridge
             )
             if let telemetry = await restoreBridge.snapshotTelemetry() {
                 runtimeExecutionMetadata = runtimeExecutionMetadata?.applying(workerTelemetry: telemetry)
@@ -139,16 +153,14 @@ struct DriveImagingService {
                 range: BackendPhaseRange(start: 0.22, end: 0.90),
                 progress: progress
             )
-            _ = try await rawDeviceWriter.write(
-                input: rawInput,
+            _ = try await writeRawInput(
+                rawInput,
                 to: rawDeviceNode,
                 expectedBytes: rawInput.logicalSizeHint,
                 targetExpectation: helperTargetExpectation,
                 phase: "Restoring image",
                 message: "Writing the converted raw image to the device.",
-                eventHandler: { event in
-                    await restoreBridge.handleWorkerEvent(event)
-                }
+                restoreBridge: restoreBridge
             )
             if let telemetry = await restoreBridge.snapshotTelemetry() {
                 runtimeExecutionMetadata = runtimeExecutionMetadata?.applying(workerTelemetry: telemetry)
@@ -339,5 +351,146 @@ struct DriveImagingService {
             expertOverrideEnabled: options.expertOverrideEnabled,
             forceUnmountWholeDisk: true
         )
+    }
+
+    private func writeRawInput(
+        _ input: RawWriteInput,
+        to rawDeviceNode: String,
+        expectedBytes: Int64?,
+        targetExpectation: PrivilegedTargetExpectation?,
+        phase: String,
+        message: String,
+        restoreBridge: WorkerProgressBridge
+    ) async throws -> PrivilegedOperationResult {
+        try await rawDeviceWriter.write(
+            input: input,
+            to: rawDeviceNode,
+            expectedBytes: expectedBytes,
+            targetExpectation: targetExpectation,
+            phase: phase,
+            message: message,
+            eventHandler: { event in
+                await restoreBridge.handleWorkerEvent(event)
+            }
+        )
+    }
+
+    private func prepareTargetForRawWrite(_ targetDisk: ExternalDisk) async throws {
+        let partitions = (try? await diskService.mountedPartitions(forWholeDisk: targetDisk.identifier)) ?? []
+        for partition in partitions {
+            if partition.mountPoint != nil {
+                _ = try? await privileged.run(
+                    "/usr/sbin/diskutil",
+                    arguments: ["unmount", "force", partition.deviceNode],
+                    phase: "Preparing target disk",
+                    message: "Unmounting \(partition.deviceNode)."
+                )
+            }
+        }
+
+        _ = try await privileged.run(
+            "/usr/sbin/diskutil",
+            arguments: ["unmountDisk", "force", targetDisk.deviceNode],
+            phase: "Preparing target disk",
+            message: "Unmounting \(targetDisk.deviceNode)."
+        )
+
+        for _ in 0..<8 {
+            let stillMounted = (try? await diskService.mountedPartitions(forWholeDisk: targetDisk.identifier)
+                .contains { $0.mountPoint != nil }) ?? false
+            if !stillMounted {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(250))
+        }
+    }
+
+    private func requestRemovableVolumeAccessIfNeeded(_ targetDisk: ExternalDisk) async throws {
+        let partitions = (try? await diskService.mountedPartitions(forWholeDisk: targetDisk.identifier)) ?? []
+        for partition in partitions {
+            guard let mountPoint = partition.mountPoint else {
+                continue
+            }
+
+            do {
+                _ = try FileManager.default.contentsOfDirectory(
+                    at: mountPoint,
+                    includingPropertiesForKeys: nil,
+                    options: [.skipsHiddenFiles]
+                )
+            } catch {
+                throw DriveImagingServiceError.removableVolumePermissionDenied(
+                    "macOS denied FlashKit access to the removable volume at \(mountPoint.path). Allow FlashKit removable-volume access, then try writing again."
+                )
+            }
+        }
+    }
+
+    private struct StagedSource: Sendable {
+        let url: URL
+        let cleanup: @Sendable () -> Void
+    }
+
+    private func stageSourceForPrivilegedRead(
+        _ sourceURL: URL,
+        progress: @escaping @Sendable (Int64, Int64, String) async -> Void
+    ) async throws -> StagedSource {
+        let fileManager = FileManager.default
+        let stagingRoot = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+            .appendingPathComponent("FlashKitRawSource-\(UUID().uuidString)", isDirectory: true)
+        let stagedURL = stagingRoot.appendingPathComponent(sourceURL.lastPathComponent)
+
+        do {
+            try fileManager.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+            try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stagingRoot.path())
+
+            do {
+                try fileManager.linkItem(at: sourceURL, to: stagedURL)
+                try? fileManager.setAttributes([.posixPermissions: 0o644], ofItemAtPath: stagedURL.path())
+                return StagedSource(url: stagedURL, cleanup: { try? FileManager.default.removeItem(at: stagingRoot) })
+            } catch {
+                let size = Int64(try sourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
+                try await copySourceForPrivilegedRead(
+                    from: sourceURL,
+                    to: stagedURL,
+                    totalBytes: size,
+                    progress: progress
+                )
+                try? fileManager.setAttributes([.posixPermissions: 0o644], ofItemAtPath: stagedURL.path())
+                return StagedSource(url: stagedURL, cleanup: { try? FileManager.default.removeItem(at: stagingRoot) })
+            }
+        } catch {
+            try? fileManager.removeItem(at: stagingRoot)
+            throw DriveImagingServiceError.sourceStagingFailed(
+                "FlashKit could not stage the source image for privileged writing: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func copySourceForPrivilegedRead(
+        from sourceURL: URL,
+        to stagedURL: URL,
+        totalBytes: Int64,
+        progress: @escaping @Sendable (Int64, Int64, String) async -> Void
+    ) async throws {
+        let sourceHandle = try FileHandle(forReadingFrom: sourceURL)
+        FileManager.default.createFile(atPath: stagedURL.path(), contents: nil)
+        let destinationHandle = try FileHandle(forWritingTo: stagedURL)
+        defer {
+            try? sourceHandle.close()
+            try? destinationHandle.close()
+        }
+
+        var copiedBytes: Int64 = 0
+        while true {
+            try Task.checkCancellation()
+            let chunk = try sourceHandle.read(upToCount: 4 * 1024 * 1024) ?? Data()
+            if chunk.isEmpty {
+                break
+            }
+            try destinationHandle.write(contentsOf: chunk)
+            copiedBytes += Int64(chunk.count)
+            await progress(copiedBytes, totalBytes, "Copying source image into temporary write staging.")
+        }
     }
 }

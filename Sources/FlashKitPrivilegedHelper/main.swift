@@ -219,10 +219,19 @@ private final class PrivilegedHelperService: NSObject, FlashKitPrivilegedHelperX
     ) async throws -> PrivilegedHelperResponse {
         try mirrorTargetChecks(expectation: request.targetExpectation)
 
-        let destinationFD = open(request.destinationDeviceNode, O_WRONLY)
-        guard destinationFD >= 0 else {
-            throw HelperError.failed("Unable to open \(request.destinationDeviceNode) for writing.")
+        if let sourceFilePath = request.sourceFilePath {
+            return try await performRawFileWriteWithDD(
+                request,
+                sourceFilePath: sourceFilePath,
+                operationID: operationID,
+                controller: controller
+            )
         }
+
+        let destinationFD = try openWritableDevice(
+            request.destinationDeviceNode,
+            expectation: request.targetExpectation
+        )
         defer { close(destinationFD) }
 
         let stderrPipe = Pipe()
@@ -231,12 +240,7 @@ private final class PrivilegedHelperService: NSObject, FlashKitPrivilegedHelperX
         var stderrTask: Task<String, Never>?
         var childPID: Int32?
 
-        if let sourceFilePath = request.sourceFilePath {
-            inputFD = open(sourceFilePath, O_RDONLY)
-            guard inputFD >= 0 else {
-                throw HelperError.failed("Unable to open \(sourceFilePath) for reading.")
-            }
-        } else if let executablePath = request.streamExecutablePath {
+        if let executablePath = request.streamExecutablePath {
             let stdoutPipe = Pipe()
             let process = Process()
             process.executableURL = URL(fileURLWithPath: executablePath)
@@ -267,9 +271,7 @@ private final class PrivilegedHelperService: NSObject, FlashKitPrivilegedHelperX
         }
 
         defer {
-            if request.sourceFilePath != nil, inputFD >= 0 {
-                close(inputFD)
-            }
+            _ = inputFD
         }
 
         let totalBytes = request.expectedBytes
@@ -298,6 +300,83 @@ private final class PrivilegedHelperService: NSObject, FlashKitPrivilegedHelperX
         }
 
         return PrivilegedHelperResponse(helperPID: getpid(), bytesTransferred: bytesTransferred)
+    }
+
+    private func performRawFileWriteWithDD(
+        _ request: PrivilegedRawWriteRequest,
+        sourceFilePath: String,
+        operationID: String,
+        controller: OperationController
+    ) async throws -> PrivilegedHelperResponse {
+        let process = Process()
+        let output = Pipe()
+        let error = Pipe()
+        let wholeDiskNode = normalizeDeviceNode(request.targetExpectation?.expectedDeviceNode ?? request.destinationDeviceNode)
+        let arguments = [
+            "-c",
+            """
+            set -e
+            /usr/sbin/diskutil unmountDisk force "$1" >&2 || true
+            i=0
+            while /sbin/mount | /usr/bin/grep -q "^$1"; do
+              /usr/sbin/diskutil unmountDisk force "$1" >&2 || true
+              i=$((i + 1))
+              if [ "$i" -ge 10 ]; then
+                break
+              fi
+              /bin/sleep 0.2
+            done
+            exec /bin/dd if="$2" of="$3" bs=4m status=none conv=fsync
+            """,
+            "flashkit-dd",
+            wholeDiskNode,
+            sourceFilePath,
+            request.destinationDeviceNode,
+        ]
+
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = arguments
+        process.standardOutput = output
+        process.standardError = error
+        try process.run()
+        controller.register(process: process)
+
+        try await emitEvent(
+            PrivilegedWorkerEvent(
+                operationID: operationID,
+                kind: .childStarted,
+                phase: request.phase,
+                helperPID: getpid(),
+                childPID: process.processIdentifier,
+                command: ["/bin/sh"] + arguments,
+                message: request.message
+            )
+        )
+
+        let outputTask = Task<Data, Never> {
+            output.fileHandleForReading.readDataToEndOfFile()
+        }
+        let errorTask = Task<Data, Never> {
+            error.fileHandleForReading.readDataToEndOfFile()
+        }
+
+        process.waitUntilExit()
+        controller.unregisterProcess()
+
+        let standardOutput = String(decoding: await outputTask.value, as: UTF8.self)
+        let standardError = String(decoding: await errorTask.value, as: UTF8.self)
+        guard process.terminationStatus == 0 else {
+            let trimmed = standardError.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw HelperError.failed(trimmed.isEmpty ? "/bin/sh exited with status \(process.terminationStatus)." : trimmed)
+        }
+
+        return PrivilegedHelperResponse(
+            helperPID: getpid(),
+            childPID: process.processIdentifier,
+            bytesTransferred: request.expectedBytes,
+            standardOutput: standardOutput,
+            standardError: standardError
+        )
     }
 
     private func performRawCapture(
@@ -589,7 +668,9 @@ private final class PrivilegedHelperService: NSObject, FlashKitPrivilegedHelperX
 
         let wholeDiskNode = normalizeDeviceNode(expectation.expectedDeviceNode)
         if expectation.forceUnmountWholeDisk {
+            try? unmountChildPartitions(of: wholeDiskNode)
             _ = try runCommandCapture("/usr/sbin/diskutil", arguments: ["unmountDisk", "force", wholeDiskNode])
+            try? unmountChildPartitions(of: wholeDiskNode)
         }
 
         let infoData = try runCommandCapture("/usr/sbin/diskutil", arguments: ["info", "-plist", wholeDiskNode]).standardOutput
@@ -633,6 +714,72 @@ private final class PrivilegedHelperService: NSObject, FlashKitPrivilegedHelperX
                 }
             }
         }
+    }
+
+    private func openWritableDevice(_ deviceNode: String, expectation: PrivilegedTargetExpectation?) throws -> Int32 {
+        let firstFD = open(deviceNode, O_WRONLY)
+        if firstFD >= 0 {
+            return firstFD
+        }
+
+        let firstErrno = errno
+        if expectation?.forceUnmountWholeDisk == true {
+            let wholeDiskNode = normalizeDeviceNode(expectation?.expectedDeviceNode ?? deviceNode)
+            try? unmountChildPartitions(of: wholeDiskNode)
+            _ = try? runCommandCapture("/usr/sbin/diskutil", arguments: ["unmountDisk", "force", wholeDiskNode])
+            usleep(250_000)
+
+            let retryFD = open(deviceNode, O_WRONLY)
+            if retryFD >= 0 {
+                return retryFD
+            }
+        }
+
+        let retryErrno = errno
+        let blockDeviceNode = deviceNode.replacingOccurrences(of: "/dev/rdisk", with: "/dev/disk")
+        if blockDeviceNode != deviceNode {
+            let blockFD = open(blockDeviceNode, O_WRONLY)
+            if blockFD >= 0 {
+                return blockFD
+            }
+        }
+
+        let blockErrno = errno
+        let rawError = errnoDescription(firstErrno)
+        let retryError = errnoDescription(retryErrno)
+        let blockError = blockDeviceNode == deviceNode ? nil : errnoDescription(blockErrno)
+        let blockDetail = blockError.map { "; block device \(blockDeviceNode): \($0)" } ?? ""
+        throw HelperError.failed(
+            "Unable to open \(deviceNode) for writing (raw device: \(rawError); after forced unmount: \(retryError)\(blockDetail))."
+        )
+    }
+
+    private func unmountChildPartitions(of wholeDiskNode: String) throws {
+        let listData = try runCommandCapture("/usr/sbin/diskutil", arguments: ["list", "-plist", wholeDiskNode]).standardOutput
+        guard let plist = try PropertyListSerialization.propertyList(from: listData, format: nil) as? [String: Any] else {
+            return
+        }
+
+        let wholeDiskIdentifier = wholeDiskNode.replacingOccurrences(of: "/dev/", with: "")
+        let entries = plist["AllDisksAndPartitions"] as? [[String: Any]] ?? []
+        let wholeDisk = entries.first { entry in
+            entry["DeviceIdentifier"] as? String == wholeDiskIdentifier
+        }
+        let partitions = wholeDisk?["Partitions"] as? [[String: Any]] ?? []
+
+        for partition in partitions {
+            guard let identifier = partition["DeviceIdentifier"] as? String else {
+                continue
+            }
+
+            let deviceNode = "/dev/\(identifier)"
+            _ = try? runCommandCapture("/usr/sbin/diskutil", arguments: ["unmount", "force", deviceNode])
+        }
+    }
+
+    private func errnoDescription(_ value: Int32) -> String {
+        let message = String(cString: strerror(value))
+        return "\(message) (errno \(value))"
     }
 
     private func runCommandCapture(_ executable: String, arguments: [String]) throws -> ProcessResult {

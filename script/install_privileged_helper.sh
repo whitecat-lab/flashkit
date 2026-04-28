@@ -6,6 +6,7 @@ set -euo pipefail
 # already-built helper into /Library.
 
 SERVICE_NAME="io.flashkit.FlashKit.PrivilegedHelper"
+APP_BUNDLE_ID="io.flashkit.FlashKit"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -45,6 +46,10 @@ install_built_helper_as_root() {
 <dict>
   <key>Label</key>
   <string>$SERVICE_NAME</string>
+  <key>AssociatedBundleIdentifiers</key>
+  <array>
+    <string>$APP_BUNDLE_ID</string>
+  </array>
   <key>MachServices</key>
   <dict>
     <key>$SERVICE_NAME</key>

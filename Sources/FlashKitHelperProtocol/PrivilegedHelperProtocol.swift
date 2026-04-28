@@ -2,7 +2,7 @@ import Foundation
 
 public enum PrivilegedHelperConstants {
     public static let machServiceName = "io.flashkit.FlashKit.PrivilegedHelper"
-    public static let protocolVersion = 1
+    public static let protocolVersion = 5
 }
 
 public enum PrivilegedSubprocessProgressParser: String, Codable, Sendable {

@@ -17,7 +17,12 @@ struct MountedDiskImage: Sendable {
     let volumeName: String
 }
 
-struct DiskImageMounter {
+protocol DiskImageMounting: Sendable {
+    func mountImage(at imageURL: URL) async throws -> MountedDiskImage
+    func detach(_ mountedImage: MountedDiskImage) async throws
+}
+
+struct DiskImageMounter: DiskImageMounting {
     private let runner = ProcessRunner()
 
     func mountImage(at imageURL: URL) async throws -> MountedDiskImage {

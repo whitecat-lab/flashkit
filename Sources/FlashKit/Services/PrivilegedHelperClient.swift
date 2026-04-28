@@ -70,8 +70,16 @@ enum PrivilegedHelperClientError: LocalizedError {
         switch self {
         case .helperUnavailable, .protocolMismatch:
             return true
-        case .invalidResponse, .remoteFailure:
+        case .invalidResponse:
             return false
+        case let .remoteFailure(message):
+            let lowercased = message.lowercased()
+            guard lowercased.contains("operation not permitted") else {
+                return false
+            }
+            return lowercased.contains("unable to open /dev/")
+                || lowercased.contains("dd: /dev/")
+                || lowercased.contains("block device /dev/")
         }
     }
 }

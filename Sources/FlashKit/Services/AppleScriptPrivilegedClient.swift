@@ -45,9 +45,31 @@ struct AppleScriptPrivilegedClient: PrivilegedOperationClient {
 
         let command: String
         let workerCommand: [String]
+        var progressFileURL: URL?
         if let sourceFilePath {
-            command = "exec /bin/dd if=\(sourceFilePath.shellQuoted) of=\(destinationDeviceNode.shellQuoted) bs=4m status=none conv=fsync"
-            workerCommand = ["/bin/dd", "if=\(sourceFilePath)", "of=\(destinationDeviceNode)", "bs=4m", "status=none", "conv=fsync"]
+            let executablePath = Bundle.main.executableURL?.path() ?? "/bin/dd"
+            if executablePath.hasSuffix("/FlashKit") {
+                let rawProgressFileURL = URL(fileURLWithPath: NSTemporaryDirectory())
+                    .appendingPathComponent("FlashKitRawProgress-\(UUID().uuidString).json")
+                progressFileURL = rawProgressFileURL
+                var arguments = [
+                    "--flashkit-raw-write",
+                    "--source",
+                    sourceFilePath,
+                    "--destination",
+                    destinationDeviceNode,
+                    "--progress-file",
+                    rawProgressFileURL.path(),
+                ]
+                if let expectedBytes {
+                    arguments.append(contentsOf: ["--expected-bytes", "\(expectedBytes)"])
+                }
+                command = "exec " + ([executablePath] + arguments).map(\.shellQuoted).joined(separator: " ")
+                workerCommand = [executablePath] + arguments
+            } else {
+                command = "exec /bin/dd if=\(sourceFilePath.shellQuoted) of=\(destinationDeviceNode.shellQuoted) bs=4m status=none conv=fsync"
+                workerCommand = ["/bin/dd", "if=\(sourceFilePath)", "of=\(destinationDeviceNode)", "bs=4m", "status=none", "conv=fsync"]
+            }
         } else if let streamExecutablePath {
             let streamCommand = ([streamExecutablePath] + streamArguments).map(\.shellQuoted).joined(separator: " ")
             let pipeline = "set -o pipefail; \(streamCommand) | /bin/dd of=\(destinationDeviceNode.shellQuoted) bs=4m status=none conv=fsync"
@@ -63,6 +85,7 @@ struct AppleScriptPrivilegedClient: PrivilegedOperationClient {
             message: message,
             bytesTransferred: expectedBytes,
             workerCommand: workerCommand,
+            progressFileURL: progressFileURL,
             eventHandler: eventHandler
         )
     }
@@ -97,18 +120,34 @@ struct AppleScriptPrivilegedClient: PrivilegedOperationClient {
         message: String,
         bytesTransferred: Int64?,
         workerCommand: [String],
+        progressFileURL: URL? = nil,
         eventHandler: PrivilegedWorkerEventHandler?
     ) async throws -> PrivilegedOperationResult {
+        let operationID = UUID().uuidString
         if let eventHandler {
             await eventHandler(
                 PrivilegedWorkerEvent(
-                    operationID: UUID().uuidString,
+                    operationID: operationID,
                     kind: .message,
                     phase: phase,
                     helperPID: 0,
                     message: "Using the macOS administrator password prompt because the privileged helper is unavailable."
                 )
             )
+        }
+
+        let progressTask = pollProgressFile(
+            progressFileURL,
+            operationID: operationID,
+            phase: phase,
+            message: message,
+            eventHandler: eventHandler
+        )
+        defer {
+            progressTask?.cancel()
+            if let progressFileURL {
+                try? FileManager.default.removeItem(at: progressFileURL)
+            }
         }
 
         let result = try await privilegeService.run(shellCommand: shellCommand) { processID in
@@ -118,7 +157,7 @@ struct AppleScriptPrivilegedClient: PrivilegedOperationClient {
 
             await eventHandler(
                 PrivilegedWorkerEvent(
-                    operationID: UUID().uuidString,
+                    operationID: operationID,
                     kind: .childStarted,
                     phase: phase,
                     helperPID: 0,
@@ -137,6 +176,42 @@ struct AppleScriptPrivilegedClient: PrivilegedOperationClient {
             standardOutput: result.standardOutputText,
             standardError: result.standardErrorText
         )
+    }
+
+    private func pollProgressFile(
+        _ progressFileURL: URL?,
+        operationID: String,
+        phase: String,
+        message: String,
+        eventHandler: PrivilegedWorkerEventHandler?
+    ) -> Task<Void, Never>? {
+        guard let progressFileURL, let eventHandler else {
+            return nil
+        }
+
+        return Task {
+            var lastCompletedBytes: Int64 = -1
+            while !Task.isCancelled {
+                if let data = try? Data(contentsOf: progressFileURL),
+                   let snapshot = try? JSONDecoder().decode(AppleScriptRawWriteProgress.self, from: data),
+                   snapshot.completedBytes != lastCompletedBytes {
+                    lastCompletedBytes = snapshot.completedBytes
+                    await eventHandler(
+                        PrivilegedWorkerEvent(
+                            operationID: operationID,
+                            kind: .progress,
+                            phase: phase,
+                            helperPID: 0,
+                            message: message,
+                            bytesCompleted: snapshot.completedBytes,
+                            totalBytes: snapshot.totalBytes,
+                            rateBytesPerSecond: snapshot.rateBytesPerSecond
+                        )
+                    )
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
     }
 
     private func shellCommand(
@@ -207,4 +282,10 @@ struct AppleScriptPrivilegedClient: PrivilegedOperationClient {
             )
         }
     }
+}
+
+private struct AppleScriptRawWriteProgress: Decodable {
+    let completedBytes: Int64
+    let totalBytes: Int64?
+    let rateBytesPerSecond: Double
 }

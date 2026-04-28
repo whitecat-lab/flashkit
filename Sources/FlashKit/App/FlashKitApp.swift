@@ -6,6 +6,7 @@ struct FlashKitApp: App {
     @State private var model = AppModel()
 
     init() {
+        FlashKitCommandLineTool.runIfRequested()
         NSApplication.shared.setActivationPolicy(.regular)
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)

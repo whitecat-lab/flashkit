@@ -117,6 +117,9 @@ actor WorkerProgressBridge {
                 phase: phase,
                 message: message ?? baseMessage,
                 fractionCompleted: mapped,
+                completedBytes: completedBytes,
+                totalBytes: totalBytes,
+                rateBytesPerSecond: rateBytesPerSecond,
                 details: details,
                 shouldLogMessage: false
             )
